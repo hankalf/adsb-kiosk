@@ -1,674 +1,241 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ADSB Live Radar</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg: #050a0f; --panel: #0b1520; --border: #0f2235;
-    --green: #00e87a; --amber: #ffaa00; --blue: #00aaff;
-    --dim: #2a4a6a; --text: #c8dff0; --muted: #4a7a9a; --red: #ff4455;
-    --purple: #cc88ff;
-    --font-mono: 'Share Tech Mono', monospace;
-    --font-display: 'Orbitron', sans-serif;
-  }
-  html, body { width:100%; height:100%; background:var(--bg); color:var(--text); font-family:var(--font-mono); overflow:hidden; }
+#!/bin/bash
+# ============================================================
+#  ADSB RADAR KIOSK — Proxmox LXC Installer
+#  github.com/hankalf/adsb-kiosk
+#
+#  Run on Proxmox HOST shell:
+#    curl -sL https://raw.githubusercontent.com/hankalf/adsb-kiosk/main/install.sh \
+#      -o /tmp/adsb-setup.sh && bash /tmp/adsb-setup.sh
+# ============================================================
+set -e
 
-  /* ── HUD ── */
-  #hud { position:fixed; top:0; left:0; right:0; height:52px; background:var(--panel); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 20px; z-index:1000; }
-  .hud-logo { font-family:var(--font-display); font-size:15px; font-weight:700; color:var(--green); letter-spacing:3px; }
-  .hud-logo span { color:var(--muted); font-weight:400; }
-  .hud-center { display:flex; gap:28px; align-items:center; }
-  .hud-stat { text-align:center; }
-  .hud-stat .val { font-family:var(--font-display); font-size:17px; font-weight:700; color:var(--green); line-height:1; }
-  .hud-stat .lbl { font-size:8px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; }
-  .hud-divider { width:1px; height:30px; background:var(--border); }
-  .hud-clock { font-family:var(--font-display); font-size:18px; color:var(--amber); letter-spacing:2px; text-align:right; }
-  .hud-date { font-size:9px; color:var(--muted); letter-spacing:1px; text-align:right; margin-top:2px; }
+# ── Change this if you fork the repo ────────────────────────
+GITHUB_RAW="https://raw.githubusercontent.com/hankalf/adsb-kiosk/main"
 
-  /* ── LAYOUT ── */
-  #layout { position:fixed; top:52px; left:0; right:0; bottom:0; display:flex; }
-  #map-wrap { flex:1; position:relative; overflow:hidden; }
-  #map { width:100%; height:100%; background:var(--bg); }
+# ── Colours ──────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; AMBER='\033[0;33m'
+BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
+success() { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn()    { echo -e "${AMBER}[WARN]${NC}  $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+header()  { echo -e "\n${BOLD}${GREEN}══════════════════════════════════════════${NC}";
+            echo -e "${BOLD}${GREEN}  $*${NC}";
+            echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}\n"; }
 
-  /* scan rings */
-  .scan-ring { position:absolute; top:50%; left:50%; border-radius:50%; transform:translate(-50%,-50%); pointer-events:none; z-index:500; animation:expand 3s ease-out infinite; }
-  #sr1 { width:60px; height:60px; border:1px solid rgba(0,232,122,0.15); }
-  #sr2 { width:60px; height:60px; border:1px solid rgba(0,232,122,0.08); animation-delay:1.5s; }
-  @keyframes expand { 0%{width:60px;height:60px;opacity:0.9} 100%{width:500px;height:500px;opacity:0} }
+# ── Preflight ────────────────────────────────────────────────
+[[ $EUID -ne 0 ]] && error "Run as root on the Proxmox HOST node."
+command -v pct    >/dev/null 2>&1 || error "pct not found — is this a Proxmox host?"
+command -v curl   >/dev/null 2>&1 || error "curl not found."
 
-  /* ── PLANE LABELS ── */
-  .plane-tag { display:flex; flex-direction:column; align-items:center; cursor:pointer; }
-  .plane-icon-glyph { line-height:1; filter:drop-shadow(0 0 5px currentColor); }
-  .plane-label-box {
-    margin-top:3px;
-    background:rgba(5,10,15,0.88);
-    border:1px solid rgba(0,232,122,0.2);
-    padding:3px 7px 4px;
-    border-radius:2px;
-    white-space:nowrap;
-    text-align:center;
-    min-width:64px;
-    max-width:160px;
-  }
-  .pl-callsign { font-family:var(--font-display); font-size:10px; font-weight:700; line-height:1.3; }
-  .pl-airline  { font-size:8px; color:var(--amber); line-height:1.3; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:150px; }
-  .pl-route    { font-size:9px; color:var(--blue);  line-height:1.3; }
-  .pl-reg      { font-size:8px; color:var(--muted); line-height:1.2; }
+header "ADSB Radar Kiosk — LXC Installer"
+echo -e "${BOLD}Radar display source:${NC} ${GITHUB_RAW}/index.html"
+echo -e "${BOLD}Enrichment:${NC} adsbdb.com + hexdb.io (no API keys needed)"
+echo ""
 
-  /* emergency flash */
-  .plane-label-box.emergency { border-color:var(--red); animation:flash 0.8s infinite; }
-  @keyframes flash { 0%,100%{background:rgba(255,68,85,0.15)} 50%{background:rgba(255,68,85,0.35)} }
+# ── User input ───────────────────────────────────────────────
+read -p "$(echo -e ${BOLD}LXC Container ID${NC} [default: 200]: )" CT_ID
+CT_ID=${CT_ID:-200}
+if pct status "$CT_ID" &>/dev/null; then
+  error "Container ID $CT_ID already exists. Choose a different ID."
+fi
 
-  /* ── CONFIG OVERLAY ── */
-  #config-overlay { position:absolute; inset:0; background:rgba(5,10,15,0.93); display:flex; align-items:center; justify-content:center; z-index:2000; }
-  #config-box { background:var(--panel); border:1px solid var(--border); padding:40px 48px; width:500px; }
-  #config-box h2 { font-family:var(--font-display); font-size:12px; letter-spacing:3px; color:var(--green); margin-bottom:28px; text-transform:uppercase; }
-  .cfg-group { margin-bottom:18px; }
-  .cfg-label { font-size:9px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; margin-bottom:5px; display:block; }
-  .cfg-input { width:100%; background:var(--bg); border:1px solid var(--dim); color:var(--text); font-family:var(--font-mono); font-size:13px; padding:8px 12px; outline:none; }
-  .cfg-input:focus { border-color:var(--green); }
-  .cfg-hint { font-size:9px; color:var(--muted); margin-top:4px; }
-  .cfg-btn { width:100%; margin-top:10px; background:var(--green); color:#000; font-family:var(--font-display); font-size:10px; letter-spacing:2px; font-weight:700; border:none; padding:13px; cursor:pointer; text-transform:uppercase; }
-  .cfg-btn:hover { background:#00ff8c; }
-  .cfg-error { color:var(--red); font-size:10px; margin-top:8px; display:none; }
+read -p "$(echo -e ${BOLD}Container hostname${NC} [default: adsb-kiosk]: )" CT_HOSTNAME
+CT_HOSTNAME=${CT_HOSTNAME:-adsb-kiosk}
 
-  /* ── RIGHT PANEL ── */
-  #panel { width:390px; min-width:340px; background:var(--panel); border-left:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
-  .sec-head { padding:9px 16px; border-bottom:1px solid var(--border); font-size:8px; letter-spacing:3px; color:var(--muted); text-transform:uppercase; display:flex; justify-content:space-between; align-items:center; flex-shrink:0; }
-  .badge { background:var(--green); color:#000; font-size:9px; font-weight:700; padding:2px 7px; border-radius:2px; }
-  .badge.amber { background:var(--amber); }
-  .badge.red   { background:var(--red); }
+echo ""
+info "Available storage pools:"
+pvesm status | awk 'NR>1 {print "  " $1 " (" $2 ")"}'
+echo ""
+read -p "$(echo -e ${BOLD}Storage pool${NC} [default: local-lvm]: )" CT_STORAGE
+CT_STORAGE=${CT_STORAGE:-local-lvm}
 
-  #ac-list-wrap { flex:1; overflow-y:auto; overflow-x:hidden; }
-  #ac-list-wrap::-webkit-scrollbar { width:3px; }
-  #ac-list-wrap::-webkit-scrollbar-thumb { background:var(--dim); }
+read -p "$(echo -e ${BOLD}Network bridge${NC} [default: vmbr0]: )" CT_BRIDGE
+CT_BRIDGE=${CT_BRIDGE:-vmbr0}
 
-  /* list item */
-  .ac-item {
-    padding:9px 14px;
-    border-bottom:1px solid var(--border);
-    cursor:pointer;
-    transition:background 0.1s;
-    display:grid;
-    grid-template-columns:76px 1fr 68px;
-    grid-template-rows:auto auto auto;
-    gap:1px 8px;
-  }
-  .ac-item:hover    { background:rgba(0,232,122,0.04); }
-  .ac-item.selected { background:rgba(0,232,122,0.08); border-left:2px solid var(--green); padding-left:12px; }
-  .ac-item.emergency-item { border-left:2px solid var(--red) !important; background:rgba(255,68,85,0.06) !important; }
+read -p "$(echo -e ${BOLD}RAM in MB${NC} [default: 1024]: )" CT_RAM
+CT_RAM=${CT_RAM:-1024}
 
-  .ac-call     { font-family:var(--font-display); font-size:12px; font-weight:700; grid-row:1; grid-column:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .ac-reg      { font-size:8px; color:var(--muted); grid-row:2; grid-column:1; }
-  .ac-airline  { font-size:9px; color:var(--amber); grid-row:3; grid-column:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .ac-route-line { font-size:10px; color:var(--blue); grid-row:1; grid-column:2; }
-  .ac-type-pos { font-size:9px; color:var(--muted); grid-row:2; grid-column:2; }
-  .ac-manuf    { font-size:8px; color:var(--muted); grid-row:3; grid-column:2; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .ac-alt      { font-size:11px; font-weight:700; grid-row:1; grid-column:3; text-align:right; }
-  .ac-spd      { font-size:9px; color:var(--muted); grid-row:2; grid-column:3; text-align:right; }
-  .ac-vs       { font-size:9px; grid-row:3; grid-column:3; text-align:right; }
-  .up   { color:var(--green); } .dn { color:var(--red); } .lvl { color:var(--muted); }
+read -p "$(echo -e ${BOLD}Disk size in GB${NC} [default: 8]: )" CT_DISK
+CT_DISK=${CT_DISK:-8}
 
-  /* ── DETAIL PANEL ── */
-  #detail { border-top:1px solid var(--border); padding:13px 16px; flex-shrink:0; }
-  #detail h3 { font-family:var(--font-display); font-size:9px; letter-spacing:2px; color:var(--muted); text-transform:uppercase; margin-bottom:10px; }
-  #detail-content { display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; }
-  .dc { display:flex; flex-direction:column; gap:1px; }
-  .dc.full { grid-column:1/3; }
-  .dc-l { font-size:8px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; }
-  .dc-v { font-size:11px; }
-  .dc-route-big { font-family:var(--font-display); font-size:13px; color:var(--blue); }
+read -p "$(echo -e ${BOLD}CPU cores${NC} [default: 2]: )" CT_CORES
+CT_CORES=${CT_CORES:-2}
 
-  /* ── ALT CHART ── */
-  #chart-wrap { height:88px; flex-shrink:0; border-top:1px solid var(--border); padding:7px 16px 5px; }
-  #chart-wrap .sec-head { padding:0 0 5px; border:none; }
-  #alt-canvas { width:100%; height:56px; display:block; }
+echo ""
+read -s -p "$(echo -e ${BOLD}Set root password for the container: ${NC})" CT_PASS; echo ""
+read -s -p "$(echo -e ${BOLD}Confirm password: ${NC})" CT_PASS2; echo ""
+[[ "$CT_PASS" != "$CT_PASS2" ]] && error "Passwords do not match."
 
-  /* ── STATUS BAR ── */
-  #statusbar { height:22px; padding:0 14px; border-top:1px solid var(--border); display:flex; align-items:center; gap:14px; flex-shrink:0; }
-  .sb { font-size:8px; color:var(--muted); letter-spacing:1px; }
-  .dot { display:inline-block; width:5px; height:5px; border-radius:50%; margin-right:4px; vertical-align:middle; animation:pulse 2s infinite; }
-  .dot.green  { background:var(--green); }
-  .dot.amber  { background:var(--amber); }
-  .dot.red    { background:var(--red); }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
+# ── Template ─────────────────────────────────────────────────
+header "Step 1/5 — Debian 12 Template"
 
-  /* leaflet dark */
-  .leaflet-tile-pane { filter:invert(1) hue-rotate(180deg) brightness(0.52) contrast(1.35) saturate(0.8); }
-  .leaflet-container { background:#050a0f; }
-  .adsb-tip { background:#0b1520 !important; border:1px solid #0f2235 !important; color:#00e87a !important; font-family:'Share Tech Mono',monospace !important; font-size:10px !important; padding:2px 7px !important; border-radius:2px !important; box-shadow:none !important; }
-</style>
-</head>
-<body>
+TEMPLATE_STORE=$(pvesm status | awk '/vztmpl|dir/ {print $1}' | head -1)
+[[ -z "$TEMPLATE_STORE" ]] && TEMPLATE_STORE="local"
+TEMPLATE=$(pveam list "$TEMPLATE_STORE" 2>/dev/null | grep "debian-12" | awk '{print $1}' | head -1)
 
-<!-- CONFIG -->
-<div id="config-overlay">
-  <div id="config-box">
-    <h2>⬡ ADSB Radar v3 — Setup</h2>
-    <div class="cfg-group">
-      <label class="cfg-label">Feeder IP or Hostname</label>
-      <input class="cfg-input" id="cfg-host" type="text" placeholder="192.168.1.xxx  or  adsb-feeder.local">
-      <div class="cfg-hint">Your local ADS-B Feeder Image address — no http:// needed</div>
-    </div>
-    <div class="cfg-group">
-      <label class="cfg-label">Your Latitude</label>
-      <input class="cfg-input" id="cfg-lat" type="text" placeholder="e.g. 37.4419">
-    </div>
-    <div class="cfg-group">
-      <label class="cfg-label">Your Longitude</label>
-      <input class="cfg-input" id="cfg-lon" type="text" placeholder="e.g. -122.1430">
-    </div>
-    <div class="cfg-group">
-      <label class="cfg-label">Station Name</label>
-      <input class="cfg-input" id="cfg-name" type="text" placeholder="Home Station">
-    </div>
-    <button class="cfg-btn" onclick="startDisplay()">INITIALIZE RADAR</button>
-    <div class="cfg-error" id="cfg-error"></div>
-    <div class="cfg-hint" style="margin-top:14px">
-      Enrichment: <strong style="color:var(--green)">adsbdb.com</strong> (aircraft + route) · <strong style="color:var(--blue)">hexdb.io</strong> (fallback route) · No API keys needed.<br>
-      Press <strong style="color:var(--green)">S</strong> anytime to reconfigure.
-    </div>
-  </div>
-</div>
+if [[ -z "$TEMPLATE" ]]; then
+  info "Downloading Debian 12 template..."
+  pveam update
+  TEMPLATE_NAME=$(pveam available | grep "debian-12-standard" | awk '{print $2}' | head -1)
+  [[ -z "$TEMPLATE_NAME" ]] && error "Could not find Debian 12 template. Run 'pveam update' manually."
+  pveam download "$TEMPLATE_STORE" "$TEMPLATE_NAME"
+  TEMPLATE="${TEMPLATE_STORE}:vztmpl/${TEMPLATE_NAME}"
+else
+  success "Found template: $TEMPLATE"
+fi
 
-<!-- HUD -->
-<div id="hud">
-  <div class="hud-logo">ADSB <span>RADAR /</span> <span id="hud-station">—</span></div>
-  <div class="hud-center">
-    <div class="hud-stat"><div class="val" id="hud-ac">0</div><div class="lbl">Aircraft</div></div>
-    <div class="hud-divider"></div>
-    <div class="hud-stat"><div class="val" id="hud-enriched">0</div><div class="lbl">Enriched</div></div>
-    <div class="hud-divider"></div>
-    <div class="hud-stat"><div class="val" id="hud-max-alt">—</div><div class="lbl">Max Alt ft</div></div>
-    <div class="hud-divider"></div>
-    <div class="hud-stat"><div class="val" id="hud-max-spd">—</div><div class="lbl">Max kts</div></div>
-    <div class="hud-divider"></div>
-    <div class="hud-stat"><div class="val" id="hud-msgs">—</div><div class="lbl">Msg/sec</div></div>
-    <div class="hud-divider"></div>
-    <div class="hud-stat"><div class="val" id="hud-emg" style="color:var(--red)">0</div><div class="lbl">Emergency</div></div>
-  </div>
-  <div>
-    <div class="hud-clock" id="hud-clock">--:--:--</div>
-    <div class="hud-date"  id="hud-date">---</div>
-  </div>
-</div>
+# ── Create LXC ───────────────────────────────────────────────
+header "Step 2/5 — Creating LXC Container"
 
-<!-- LAYOUT -->
-<div id="layout">
-  <div id="map-wrap">
-    <div id="map"></div>
-    <div class="scan-ring" id="sr1"></div>
-    <div class="scan-ring" id="sr2"></div>
-  </div>
-  <div id="panel">
-    <div class="sec-head">
-      Live Traffic
-      <span class="badge" id="panel-count">0</span>
-    </div>
-    <div id="ac-list-wrap"><div id="ac-list"></div></div>
-    <div id="chart-wrap">
-      <div class="sec-head">Altitude Distribution</div>
-      <canvas id="alt-canvas"></canvas>
-    </div>
-    <div id="detail">
-      <h3>Selected Aircraft</h3>
-      <div id="detail-empty" style="font-size:10px;color:var(--muted);font-style:italic">Tap any aircraft for details</div>
-      <div id="detail-content" style="display:none"></div>
-    </div>
-    <div id="statusbar">
-      <span class="sb"><span class="dot green"></span><span id="sb-live">Connecting...</span></span>
-      <span class="sb"><span class="dot amber" id="enrich-dot"></span><span id="sb-enrich">adsbdb: idle</span></span>
-      <span class="sb" id="sb-time">—</span>
-    </div>
-  </div>
-</div>
+info "Creating container $CT_ID ($CT_HOSTNAME)..."
+pct create "$CT_ID" "$TEMPLATE" \
+  --hostname "$CT_HOSTNAME" \
+  --password "$CT_PASS" \
+  --cores "$CT_CORES" \
+  --memory "$CT_RAM" \
+  --rootfs "${CT_STORAGE}:${CT_DISK}" \
+  --net0 "name=eth0,bridge=${CT_BRIDGE},ip=dhcp" \
+  --features nesting=1 \
+  --unprivileged 1 \
+  --ostype debian \
+  --start 1
 
-<script>
-// ── helpers ──────────────────────────────────────────────────
-const $  = id => document.getElementById(id);
-const LS = { get: k => { try { return localStorage.getItem(k) } catch { return null } },
-             set: (k,v) => { try { localStorage.setItem(k,v) } catch {} } };
+success "Container $CT_ID created and started."
+info "Waiting for container to boot..."
+sleep 8
 
-// ── state ────────────────────────────────────────────────────
-let map, planeLayers = {}, planeData = {}, selectedHex = null;
-let feederURL = '', myLat = 0, myLon = 0, stationName = '';
+CT_IP=""
+for i in {1..15}; do
+  CT_IP=$(pct exec "$CT_ID" -- ip -4 addr show eth0 2>/dev/null \
+    | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
+  [[ -n "$CT_IP" ]] && break
+  sleep 2
+done
+[[ -n "$CT_IP" ]] && success "Container IP: $CT_IP" \
+  || warn "Could not auto-detect IP — DHCP may still be pending."
 
-// Enrichment cache keyed by HEX (primary) and CALLSIGN (secondary)
-// Each entry: { registration, owner, manufacturer, type_full, icao_type,
-//               airline_name, airline_icao, origin_iata, origin_icao, origin_name,
-//               dest_iata, dest_icao, dest_name, source, fetched_at }
-const enrichByHex  = {};   // hex -> data
-const enrichByCall = {};   // callsign -> data
-const ENRICH_TTL   = 15 * 60 * 1000;  // 15 min
-const hexQueue     = [];   // [{hex, callsign}] FIFO
-const hexQueued    = new Set();
-let enrichBusy = false;
-let enrichedTotal = 0;
+# ── Install packages ─────────────────────────────────────────
+header "Step 3/5 — Installing Packages"
 
-// ── config ────────────────────────────────────────────────────
-function loadSaved() {
-  ['host','lat','lon','name'].forEach(k => {
-    const v = LS.get('adsb_' + k);
-    if (v) $('cfg-' + k).value = v;
-  });
-  if (LS.get('adsb_host') && LS.get('adsb_lat') && LS.get('adsb_lon')) startDisplay();
-}
+info "Installing Xorg, Openbox, Chromium, Python3..."
+pct exec "$CT_ID" -- bash -c "
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq \
+    xorg openbox chromium unclutter python3 \
+    fonts-liberation fonts-dejavu ca-certificates \
+    dbus-x11 curl 2>&1 | tail -3
+"
+success "Packages installed."
 
-async function startDisplay() {
-  const hostRaw = $('cfg-host').value.trim();
-  const lat  = parseFloat($('cfg-lat').value);
-  const lon  = parseFloat($('cfg-lon').value);
-  const name = $('cfg-name').value.trim() || 'Home Station';
-  const err  = $('cfg-error');
-  err.style.display = 'none';
-  if (!hostRaw || isNaN(lat) || isNaN(lon)) {
-    err.textContent = 'Please fill in all fields.'; err.style.display = 'block'; return;
-  }
-  const host = hostRaw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
-  feederURL = `http://${host}`; myLat = lat; myLon = lon; stationName = name;
-  try {
-    const r = await fetch(`${feederURL}/data/aircraft.json`, { signal: AbortSignal.timeout(5000) });
-    if (!r.ok) throw new Error();
-  } catch {
-    err.textContent = `Cannot reach feeder at ${feederURL} — check IP/hostname.`;
-    err.style.display = 'block'; return;
-  }
-  ['host','lat','lon','name'].forEach(k => LS.set('adsb_' + k, k === 'host' ? host : k === 'lat' ? lat : k === 'lon' ? lon : name));
-  $('config-overlay').style.display = 'none';
-  $('hud-station').textContent = name.toUpperCase();
-  initMap(); startPolling();
-}
+# ── Deploy display ───────────────────────────────────────────
+header "Step 4/5 — Deploying ADSB Radar Display"
 
-// ── map ───────────────────────────────────────────────────────
-function initMap() {
-  map = L.map('map', { center:[myLat,myLon], zoom:8, zoomControl:false, attributionControl:false });
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:18 }).addTo(map);
-  const hi = L.divIcon({ html:`<div style="width:10px;height:10px;border:2px solid #ffaa00;border-radius:50%;background:rgba(255,170,0,0.25)"></div>`, className:'', iconAnchor:[5,5] });
-  L.marker([myLat,myLon], { icon:hi })
-   .bindTooltip(stationName, { permanent:false, direction:'top', className:'adsb-tip' })
-   .addTo(map);
-  [50,100,200].forEach(nm =>
-    L.circle([myLat,myLon], { radius:nm*1852, color:'#0f2235', weight:1, fill:false, dashArray:'3 5' }).addTo(map)
-  );
-}
+info "Creating /opt/adsb-kiosk..."
+pct exec "$CT_ID" -- mkdir -p /opt/adsb-kiosk
 
-// ── polling ───────────────────────────────────────────────────
-function startPolling() {
-  fetchData();
-  setInterval(fetchData, 5000);
-  tickClock(); setInterval(tickClock, 1000);
-  setInterval(drainQueue, 800);  // process one enrichment every 0.8s — well under any rate limit
-}
+info "Downloading radar display from GitHub..."
+pct exec "$CT_ID" -- bash -c "
+  curl -sL '${GITHUB_RAW}/index.html' -o /opt/adsb-kiosk/index.html
+  echo 'Downloaded:' \$(wc -c < /opt/adsb-kiosk/index.html) 'bytes'
+"
+success "Radar display deployed."
 
-function tickClock() {
-  const n = new Date();
-  $('hud-clock').textContent = n.toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  $('hud-date').textContent  = n.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'}).toUpperCase();
-}
+info "Writing web server systemd service..."
+pct exec "$CT_ID" -- bash -c "cat > /etc/systemd/system/adsb-webserver.service << 'EOF'
+[Unit]
+Description=ADSB Radar Web Server
+After=network.target
 
-async function fetchData() {
-  try {
-    const r = await fetch(`${feederURL}/data/aircraft.json`, { signal: AbortSignal.timeout(8000) });
-    const j = await r.json();
-    processData(j);
-    $('sb-live').textContent = 'Live';
-    $('sb-time').textContent = 'Updated ' + new Date().toLocaleTimeString('en-US',{hour12:false});
-  } catch {
-    $('sb-live').textContent = 'Reconnecting...';
-  }
-}
+[Service]
+Type=simple
+WorkingDirectory=/opt/adsb-kiosk
+ExecStart=/usr/bin/python3 -m http.server 8080
+Restart=always
+RestartSec=3
 
-function processData(json) {
-  const all = (json.aircraft || []).filter(a => a.lat && a.lon);
-  planeData = {};
-  all.forEach(a => { if (a.hex) planeData[a.hex] = a; });
+[Install]
+WantedBy=multi-user.target
+EOF"
 
-  // queue enrichment
-  all.forEach(a => {
-    if (!a.hex) return;
-    const hex = a.hex.toLowerCase();
-    const cached = enrichByHex[hex];
-    if (!cached || Date.now() - cached.fetched_at > ENRICH_TTL) {
-      if (!hexQueued.has(hex)) { hexQueued.add(hex); hexQueue.push({ hex, callsign: a.flight?.trim() || null }); }
-    }
-  });
+info "Writing kiosk launch script..."
+pct exec "$CT_ID" -- bash -c "cat > /opt/adsb-kiosk/start-kiosk.sh << 'EOF'
+#!/bin/bash
+sleep 3
+export DISPLAY=:0
+export HOME=/root
+export XAUTHORITY=/root/.Xauthority
+unclutter -idle 1 -root &
+xset s off
+xset -dpms
+xset s noblank
+/usr/bin/chromium \
+  --kiosk \
+  --noerrdialogs \
+  --disable-infobars \
+  --no-first-run \
+  --disable-session-crashed-bubble \
+  --disable-restore-session-state \
+  --no-sandbox \
+  --user-data-dir=/root/.chromium-kiosk \
+  --app=http://localhost:8080/index.html
+EOF
+chmod +x /opt/adsb-kiosk/start-kiosk.sh"
 
-  updateHUD(all, json);
-  updateMap(all);
-  updateList(all);
-  drawAltChart(all);
-  if (selectedHex && planeData[selectedHex]) updateDetail(planeData[selectedHex]);
-}
+info "Writing kiosk systemd service..."
+pct exec "$CT_ID" -- bash -c "cat > /etc/systemd/system/adsb-kiosk.service << 'EOF'
+[Unit]
+Description=ADSB Radar Kiosk Display
+After=network.target adsb-webserver.service
+Requires=adsb-webserver.service
 
-// ── enrichment engine ─────────────────────────────────────────
-// Strategy:
-//   1. GET api.adsbdb.com/v0/aircraft/{HEX}?callsign={CS}
-//      → gives aircraft (owner, registration, type, manufacturer) + flightroute (airline, origin, dest)
-//   2. If route still missing and callsign known → GET hexdb.io/callsign-route?callsign={CS}
-//      → gives raw "EGLL-LEBL" route string
+[Service]
+Type=simple
+User=root
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/root/.Xauthority
+ExecStartPre=/bin/bash -c 'X :0 -nolisten tcp &>/var/log/xorg-kiosk.log & sleep 2'
+ExecStart=/opt/adsb-kiosk/start-kiosk.sh
+Restart=always
+RestartSec=5
 
-async function drainQueue() {
-  if (enrichBusy || hexQueue.length === 0) return;
-  enrichBusy = true;
-  const { hex, callsign } = hexQueue.shift();
-  hexQueued.delete(hex);
+[Install]
+WantedBy=multi-user.target
+EOF"
 
-  $('sb-enrich').textContent = `adsbdb: ${hex.toUpperCase()}`;
+info "Enabling services..."
+pct exec "$CT_ID" -- bash -c "
+  systemctl daemon-reload
+  systemctl enable adsb-webserver adsb-kiosk
+  systemctl start adsb-webserver
+"
+success "Services configured."
 
-  try {
-    const url = callsign
-      ? `https://api.adsbdb.com/v0/aircraft/${hex.toUpperCase()}?callsign=${callsign}`
-      : `https://api.adsbdb.com/v0/aircraft/${hex.toUpperCase()}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(7000) });
-    if (r.ok) {
-      const j = await r.json();
-      const ac = j?.response?.aircraft;
-      const fr = j?.response?.flightroute;
-      const entry = {
-        registration:  ac?.registration  || null,
-        owner:         ac?.registered_owner || null,
-        manufacturer:  ac?.manufacturer   || null,
-        type_full:     ac?.type           || null,
-        icao_type:     ac?.icao_type      || null,
-        airline_name:  fr?.airline?.name  || null,
-        airline_icao:  fr?.airline?.icao  || null,
-        origin_iata:   fr?.origin?.iata_code   || null,
-        origin_icao:   fr?.origin?.icao_code   || null,
-        origin_name:   fr?.origin?.name        || null,
-        origin_muni:   fr?.origin?.municipality || null,
-        dest_iata:     fr?.destination?.iata_code   || null,
-        dest_icao:     fr?.destination?.icao_code   || null,
-        dest_name:     fr?.destination?.name        || null,
-        dest_muni:     fr?.destination?.municipality || null,
-        source: 'adsbdb',
-        fetched_at: Date.now()
-      };
-      enrichByHex[hex] = entry;
-      if (callsign) enrichByCall[callsign] = entry;
+# ── Done ─────────────────────────────────────────────────────
+header "Step 5/5 — Done!"
 
-      // If we got aircraft data but no route, try hexdb for route
-      if (!entry.origin_iata && callsign) {
-        tryHexdbRoute(hex, callsign, entry);
-      } else {
-        finaliseEnrich(hex);
-      }
-    } else {
-      // adsbdb miss — try hexdb for route at minimum
-      if (callsign) tryHexdbRoute(hex, callsign, null);
-      else { enrichByHex[hex] = { fetched_at: Date.now(), source:'miss' }; }
-    }
-  } catch {
-    enrichByHex[hex] = { fetched_at: Date.now(), source:'error' };
-  }
-
-  $('sb-enrich').textContent = `adsbdb: ${enrichedTotal} cached`;
-  enrichBusy = false;
-}
-
-async function tryHexdbRoute(hex, callsign, existingEntry) {
-  try {
-    const r = await fetch(`https://hexdb.io/callsign-route?callsign=${callsign}`, { signal: AbortSignal.timeout(5000) });
-    if (r.ok) {
-      const text = (await r.text()).trim();  // returns e.g. "EGLL-LEBL"
-      if (text && text.includes('-')) {
-        const [orig, dest] = text.split('-');
-        const base = existingEntry || { source:'hexdb', fetched_at: Date.now() };
-        base.origin_icao = base.origin_icao || orig;
-        base.origin_iata = base.origin_iata || orig;
-        base.dest_icao   = base.dest_icao   || dest;
-        base.dest_iata   = base.dest_iata   || dest;
-        base.fetched_at  = Date.now();
-        base.source      = existingEntry ? 'adsbdb+hexdb' : 'hexdb';
-        enrichByHex[hex] = base;
-        enrichByCall[callsign] = base;
-      }
-    }
-  } catch {}
-  finaliseEnrich(hex);
-}
-
-function finaliseEnrich(hex) {
-  const e = enrichByHex[hex];
-  if (e && (e.registration || e.origin_iata || e.airline_name)) enrichedTotal++;
-  $('hud-enriched').textContent = enrichedTotal;
-  // re-render affected aircraft
-  if (planeData[hex]) {
-    updateMap(Object.values(planeData));
-    updateList(Object.values(planeData));
-    if (selectedHex === hex) updateDetail(planeData[hex]);
-  }
-}
-
-function getEnrich(hex) {
-  return hex ? (enrichByHex[hex.toLowerCase()] || null) : null;
-}
-
-// ── helpers ───────────────────────────────────────────────────
-function altColor(alt) {
-  if (typeof alt !== 'number') return '#4a7a9a';
-  if (alt < 5000)  return '#00e87a';
-  if (alt < 15000) return '#00aaff';
-  if (alt < 30000) return '#ffaa00';
-  return '#ff6688';
-}
-function fmtAlt(v) {
-  if (v === 'ground' || v === 0) return 'GND';
-  if (typeof v !== 'number') return '—';
-  return v.toLocaleString() + ' ft';
-}
-function distNM(lat1,lon1,lat2,lon2) {
-  const R=3440.065,dLat=(lat2-lat1)*Math.PI/180,dLon=(lon2-lon1)*Math.PI/180;
-  const a=Math.sin(dLat/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
-  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
-}
-function hdg(h) { return ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'][Math.round(h/22.5)%16]; }
-function isEmergency(a) { return a.squawk && ['7700','7600','7500'].includes(a.squawk); }
-function fmtRoute(e) {
-  if (!e) return null;
-  const o = e.origin_iata || e.origin_icao;
-  const d = e.dest_iata   || e.dest_icao;
-  if (o && d) return `${o} → ${d}`;
-  if (d) return `→ ${d}`;
-  return null;
-}
-function shortOwner(owner) {
-  if (!owner) return null;
-  // Trim common legal suffixes for display
-  return owner.replace(/(,?\s*(INC|LLC|LTD|CORP|CO|PLC|SA|GMBH|BV|AS|AB|SRL|SPA)\.?)+$/i,'').trim();
-}
-
-// ── map update ────────────────────────────────────────────────
-function buildIcon(a, color) {
-  const heading = a.track || 0;
-  const label   = a.flight ? a.flight.trim() : a.hex ? a.hex.toUpperCase() : '?';
-  const e       = getEnrich(a.hex);
-  const route   = fmtRoute(e);
-  const airline = e?.airline_name || (e?.owner ? shortOwner(e.owner) : null);
-  const reg     = e?.registration || null;
-  const emg     = isEmergency(a);
-
-  return L.divIcon({
-    html: `<div class="plane-tag">
-      <div class="plane-icon-glyph" style="color:${color};font-size:${emg?20:16}px;transform:rotate(${heading}deg)">${emg?'⚠':'✈'}</div>
-      <div class="plane-label-box${emg?' emergency':''}">
-        <div class="pl-callsign" style="color:${color}">${label}</div>
-        ${airline ? `<div class="pl-airline">${airline}</div>` : ''}
-        ${route   ? `<div class="pl-route">${route}</div>`     : ''}
-        ${reg && !airline && !route ? `<div class="pl-reg">${reg}</div>` : ''}
-      </div>
-    </div>`,
-    className: '',
-    iconAnchor: [40, 10]
-  });
-}
-
-function updateMap(aircraft) {
-  const seen = new Set();
-  aircraft.forEach(a => {
-    if (!a.hex || !a.lat || !a.lon) return;
-    seen.add(a.hex);
-    const color = altColor(a.alt_baro);
-    const icon  = buildIcon(a, color);
-    if (planeLayers[a.hex]) {
-      planeLayers[a.hex].setLatLng([a.lat, a.lon]);
-      planeLayers[a.hex].setIcon(icon);
-    } else {
-      const m = L.marker([a.lat, a.lon], { icon, zIndexOffset: isEmergency(a) ? 1000 : 100 });
-      m.on('click', () => selectAircraft(a.hex));
-      m.addTo(map);
-      planeLayers[a.hex] = m;
-    }
-  });
-  Object.keys(planeLayers).forEach(hex => {
-    if (!seen.has(hex)) { planeLayers[hex].remove(); delete planeLayers[hex]; }
-  });
-}
-
-// ── list update ───────────────────────────────────────────────
-function updateList(aircraft) {
-  const emgCount = aircraft.filter(isEmergency).length;
-  $('hud-emg').textContent = emgCount;
-
-  const sorted = [...aircraft].sort((a,b) => {
-    // emergencies first, then by altitude desc
-    const ea = isEmergency(a), eb = isEmergency(b);
-    if (ea && !eb) return -1; if (!ea && eb) return 1;
-    return (typeof b.alt_baro==='number'?b.alt_baro:-1) - (typeof a.alt_baro==='number'?a.alt_baro:-1);
-  });
-
-  const list = $('ac-list');
-  const existingHexes = new Set([...list.querySelectorAll('.ac-item')].map(el=>el.dataset.hex));
-  const newHexes = new Set(sorted.map(a=>a.hex));
-  existingHexes.forEach(hex => { if (!newHexes.has(hex)) list.querySelector(`[data-hex="${hex}"]`)?.remove(); });
-
-  sorted.forEach(a => {
-    const color   = altColor(a.alt_baro);
-    const label   = a.flight ? a.flight.trim() : a.hex ? a.hex.toUpperCase() : '?';
-    const e       = getEnrich(a.hex);
-    const route   = fmtRoute(e);
-    const airline = e?.airline_name || null;
-    const reg     = e?.registration || null;
-    const manuf   = e?.manufacturer || null;
-    const type    = e?.type_full || a.t || null;
-    const vs      = a.baro_rate;
-    const vsCl    = !vs?'lvl':vs>100?'up':vs<-100?'dn':'lvl';
-    const vsCh    = !vs?'━':vs>100?'▲':vs<-100?'▼':'━';
-    const dist    = a.lat&&a.lon ? distNM(myLat,myLon,a.lat,a.lon) : null;
-    const emg     = isEmergency(a);
-
-    const html = `
-      <div class="ac-call" style="color:${emg?'var(--red)':color}">${label}${emg?` ⚠${a.squawk}`:''}</div>
-      <div class="ac-reg">${reg || (a.hex?a.hex.toUpperCase():'')}</div>
-      <div class="ac-airline">${airline || '—'}</div>
-      <div class="ac-route-line">${route || '—'}</div>
-      <div class="ac-type-pos">${type||'—'} · ${dist!==null?dist.toFixed(0)+'nm':'—'} ${a.track!==undefined?hdg(a.track):''}</div>
-      <div class="ac-manuf">${manuf || ''}</div>
-      <div class="ac-alt" style="color:${color}">${fmtAlt(a.alt_baro)}</div>
-      <div class="ac-spd">${a.gs?Math.round(a.gs)+' kt':'—'}</div>
-      <div class="ac-vs ${vsCl}">${vsCh}${vs?Math.abs(Math.round(vs)):''}</div>`;
-
-    let el = list.querySelector(`[data-hex="${a.hex}"]`);
-    if (el) {
-      el.innerHTML = html;
-      el.className = `ac-item${a.hex===selectedHex?' selected':''}${emg?' emergency-item':''}`;
-    } else {
-      el = document.createElement('div');
-      el.className = `ac-item${a.hex===selectedHex?' selected':''}${emg?' emergency-item':''}`;
-      el.dataset.hex = a.hex;
-      el.innerHTML = html;
-      el.addEventListener('click', () => selectAircraft(a.hex));
-      list.appendChild(el);
-    }
-  });
-}
-
-// ── select / detail ───────────────────────────────────────────
-function selectAircraft(hex) {
-  selectedHex = hex;
-  document.querySelectorAll('.ac-item').forEach(el => el.classList.toggle('selected', el.dataset.hex===hex));
-  const a = planeData[hex];
-  if (a) { map.panTo([a.lat, a.lon]); updateDetail(a); }
-}
-
-function updateDetail(a) {
-  $('detail-empty').style.display = 'none';
-  const dc = $('detail-content');
-  dc.style.display = 'grid';
-  const e     = getEnrich(a.hex);
-  const label = a.flight?.trim() || a.hex?.toUpperCase() || '?';
-  const dist  = a.lat&&a.lon ? distNM(myLat,myLon,a.lat,a.lon) : null;
-  const route = fmtRoute(e);
-  const originFull = e?.origin_name ? `${e.origin_name}${e.origin_muni?', '+e.origin_muni:''}` : null;
-  const destFull   = e?.dest_name   ? `${e.dest_name}${e.dest_muni?', '+e.dest_muni:''}`       : null;
-
-  dc.innerHTML = `
-    ${route ? `<div class="dc full"><div class="dc-l">Route</div><div class="dc-route-big">${route}</div></div>` : ''}
-    <div class="dc full"><div class="dc-l">Airline / Operator</div><div class="dc-v" style="color:var(--amber)">${e?.airline_name || (e?.owner ? shortOwner(e.owner) : '—')}</div></div>
-    <div class="dc"><div class="dc-l">Callsign</div><div class="dc-v" style="color:var(--green)">${label}</div></div>
-    <div class="dc"><div class="dc-l">Registration</div><div class="dc-v">${e?.registration || '—'}</div></div>
-    <div class="dc"><div class="dc-l">Aircraft</div><div class="dc-v" style="color:var(--purple)">${e?.type_full || a.t || '—'}</div></div>
-    <div class="dc"><div class="dc-l">Manufacturer</div><div class="dc-v">${e?.manufacturer || '—'}</div></div>
-    ${originFull ? `<div class="dc"><div class="dc-l">Origin</div><div class="dc-v" style="color:var(--blue)">${originFull}</div></div>` : '<div class="dc"><div class="dc-l">Origin</div><div class="dc-v">—</div></div>'}
-    ${destFull   ? `<div class="dc"><div class="dc-l">Destination</div><div class="dc-v" style="color:var(--blue)">${destFull}</div></div>` : '<div class="dc"><div class="dc-l">Destination</div><div class="dc-v">—</div></div>'}
-    <div class="dc"><div class="dc-l">Altitude</div><div class="dc-v" style="color:${altColor(a.alt_baro)}">${fmtAlt(a.alt_baro)}</div></div>
-    <div class="dc"><div class="dc-l">Speed</div><div class="dc-v">${a.gs?Math.round(a.gs)+' kts':'—'}</div></div>
-    <div class="dc"><div class="dc-l">Heading</div><div class="dc-v">${a.track!==undefined?Math.round(a.track)+'° '+hdg(a.track):'—'}</div></div>
-    <div class="dc"><div class="dc-l">Vert. Rate</div><div class="dc-v">${a.baro_rate?Math.round(a.baro_rate)+' fpm':'—'}</div></div>
-    <div class="dc"><div class="dc-l">Distance</div><div class="dc-v">${dist!==null?dist.toFixed(1)+' nm':'—'}</div></div>
-    <div class="dc"><div class="dc-l">ICAO Hex</div><div class="dc-v">${a.hex?.toUpperCase()||'—'}</div></div>
-    <div class="dc"><div class="dc-l">Squawk</div><div class="dc-v" style="color:${isEmergency(a)?'var(--red)':'inherit'}">${a.squawk||'—'}</div></div>
-    <div class="dc"><div class="dc-l">Source</div><div class="dc-v" style="color:var(--muted);font-size:9px">${e?.source||'pending'}</div></div>`;
-}
-
-// ── HUD update ────────────────────────────────────────────────
-function updateHUD(aircraft, json) {
-  $('hud-ac').textContent    = aircraft.length;
-  $('panel-count').textContent = aircraft.length;
-  const alts = aircraft.map(a=>a.alt_baro).filter(x=>typeof x==='number'&&x>0);
-  const spds = aircraft.map(a=>a.gs).filter(x=>typeof x==='number');
-  $('hud-max-alt').textContent = alts.length ? Math.max(...alts).toLocaleString() : '—';
-  $('hud-max-spd').textContent = spds.length ? Math.round(Math.max(...spds)) : '—';
-  $('hud-msgs').textContent    = json.messages ? Math.round(json.messages) : '—';
-}
-
-// ── alt chart ─────────────────────────────────────────────────
-function drawAltChart(aircraft) {
-  const canvas = $('alt-canvas'), ctx = canvas.getContext('2d');
-  const W = canvas.offsetWidth, H = canvas.offsetHeight;
-  canvas.width = W; canvas.height = H;
-  ctx.clearRect(0,0,W,H);
-  const bands = [
-    {label:'GND',min:-Infinity,max:5000,color:'#00e87a'},
-    {label:'5K', min:5000,max:15000,color:'#00aaff'},
-    {label:'15K',min:15000,max:30000,color:'#ffaa00'},
-    {label:'30K+',min:30000,max:Infinity,color:'#ff6688'},
-  ];
-  const counts = bands.map(b=>aircraft.filter(a=>typeof a.alt_baro==='number'&&a.alt_baro>=b.min&&a.alt_baro<b.max).length);
-  const maxC = Math.max(...counts, 1), bw = Math.floor((W-36)/bands.length);
-  bands.forEach((b,i) => {
-    const barH = Math.max(2,Math.round((counts[i]/maxC)*(H-18)));
-    ctx.fillStyle = b.color+'33'; ctx.fillRect(18+i*bw+3,H-13-barH,bw-6,barH);
-    ctx.fillStyle = b.color;     ctx.fillRect(18+i*bw+3,H-13-barH,bw-6,2);
-    ctx.font='8px "Share Tech Mono"'; ctx.fillStyle='#4a7a9a'; ctx.textAlign='center';
-    ctx.fillText(b.label, 18+i*bw+bw/2, H-2);
-    if (counts[i]>0) { ctx.fillStyle=b.color; ctx.fillText(counts[i], 18+i*bw+bw/2, H-13-barH-3); }
-  });
-}
-
-// ── keyboard ──────────────────────────────────────────────────
-document.addEventListener('keydown', e => {
-  if (e.key==='s'||e.key==='S') $('config-overlay').style.display='flex';
-  if (e.key==='Escape' && $('config-overlay').style.display!=='none') $('config-overlay').style.display='none';
-});
-
-loadSaved();
-</script>
-</body>
-</html>
+echo -e "${BOLD}${GREEN}✔  ADSB Radar Kiosk is installed!${NC}"
+echo ""
+echo -e "  ${BOLD}Container ID:${NC}   $CT_ID"
+echo -e "  ${BOLD}Hostname:${NC}       $CT_HOSTNAME"
+[[ -n "$CT_IP" ]] && echo -e "  ${BOLD}IP Address:${NC}     ${AMBER}$CT_IP${NC}"
+echo ""
+echo -e "${BOLD}Open in any browser on your network:${NC}"
+[[ -n "$CT_IP" ]] && echo -e "  ${AMBER}http://$CT_IP:8080${NC}"
+echo ""
+echo -e "${BOLD}Start the projector kiosk:${NC}"
+echo -e "  pct exec $CT_ID -- systemctl start adsb-kiosk"
+echo ""
+echo -e "${BOLD}To update the display in future:${NC}"
+echo -e "  1. Edit ${BLUE}index.html${NC} in your GitHub repo"
+echo -e "  2. Run on Proxmox:"
+echo -e "     ${AMBER}pct exec $CT_ID -- bash -c \"curl -sL ${GITHUB_RAW}/index.html -o /opt/adsb-kiosk/index.html && systemctl restart adsb-kiosk\"${NC}"
+echo ""
+echo -e "${BOLD}Other useful commands:${NC}"
+echo -e "  pct exec $CT_ID -- systemctl status adsb-kiosk"
+echo -e "  pct exec $CT_ID -- journalctl -u adsb-kiosk -f"
+echo -e "  pct stop $CT_ID   # shut down"
+echo -e "  pct start $CT_ID  # start up"
+echo ""
+echo -e "${BOLD}${GREEN}Enjoy your radar! ✈${NC}"
