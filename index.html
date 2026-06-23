@@ -496,7 +496,7 @@ function buildIcon(a, color) {
 
   return L.divIcon({
     html: `<div class="plane-tag">
-      <div class="plane-icon-glyph" style="color:${color};font-size:${emg?20:16}px;transform:rotate(${heading}deg)">${emg?'⚠':'✈'}</div>
+      <div class="plane-icon-glyph" style="color:${color};font-size:${emg?20:16}px;transform:rotate(${heading - 45}deg)">${emg?'⚠':'✈'}</div>
       <div class="plane-label-box${emg?' emergency':''}">
         <div class="pl-callsign" style="color:${color}">${label}</div>
         ${airline ? `<div class="pl-airline">${airline}</div>` : ''}
